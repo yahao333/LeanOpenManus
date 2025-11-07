@@ -108,5 +108,3 @@ if __name__ == "__main__":
   - 智能体的核心能力都在 `app/agent/manus.py` 及其依赖模块中实现；`main.py` 把用户输入交给它，并维护可靠的生命周期。
   - 使用 `finally` 保证 `cleanup` 一定执行，是健壮性与资源管理的关键。
 
-如果你愿意，我们下一步可以深入 `app/agent/manus.py` 的 `create/run/cleanup` 三个方法，配合它的 `prompt` 与 `config`，从“如何构建一个可运行的 Agent”层面继续学习。也可以先在本地 venv（Python 3.12）下运行一个最小示例来观察实际行为。
-        
