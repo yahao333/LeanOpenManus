@@ -1,4 +1,9 @@
-# main.py
+# 目录
+- [入口文件](#入口文件)
+- [Manus核心架构](#Manus-智能体核心架构与执行流程详解)
+- [OpenManus核心流程](#OpenManus-核心执行流程与状态演进分析)
+
+# 入口文件
 
 **功能定位与角色**
 - main.py 的功能定位
@@ -110,7 +115,7 @@ if __name__ == "__main__":
   - 智能体的核心能力都在 `app/agent/manus.py` 及其依赖模块中实现；`main.py` 把用户输入交给它，并维护可靠的生命周期。
   - 使用 `finally` 保证 `cleanup` 一定执行，是健壮性与资源管理的关键。
 
-# app/agent/manus.py
+# Manus 智能体核心架构与执行流程详解
 
 我先快速定位并阅读 Manus 智能体源码及其依赖的 prompt 与 config。随后提炼 create/run/cleanup 的执行流程与关键设计。
         
