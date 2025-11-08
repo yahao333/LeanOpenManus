@@ -337,3 +337,162 @@ async def think(self) -> bool:
 - 如需体验完整流程，建议在 venv（Python 3.12）中运行 `python main.py --prompt "在当前工程中搜索 README 并总结要点"` 观察工具调用与日志输出。
 
         
+
+# OpenManus 核心执行流程与状态演进分析
+      
+我先聚焦 `ToolCallAgent.run` 与 `ReActAgent.run/think` 的调用链。接着会逐步梳理一次完整“输入到结果”的状态演进。
+        
+现在按“用户输入 → 工具选择 → 执行 → 结果”的实际调用链，详细追踪消息与状态的演进过程。
+
+**总体流程**
+- 用户调用入口：`agent.run(request)`，触发运行循环和状态管理。
+- 循环每步执行：`ReActAgent.step()` 先 `think()` 再 `act()`。
+- 工具选择：`ToolCallAgent.think()` 组织消息与工具描述，调用 `LLM.ask_tool` 获取 `tool_calls`。
+- 工具执行：`ToolCallAgent.act()` 遍历 `tool_calls`，通过 `ToolCollection.execute` 执行工具，写入观察结果。
+- 结束与清理：命中特殊工具（如 `terminate`）或达到步数上限时结束；`ToolCallAgent.run` 在 `finally` 执行 `cleanup()`。
+
+**运行入口**
+- 关键方法：`BaseAgent.run(request)`。
+- 初始状态检查：要求 `state == AgentState.IDLE`，否则抛错。
+- 写入初始用户消息：`update_memory("user", request)` 等价于 `Memory.add_message(Message.user_message(request))`。
+- 切换到运行态：使用 `state_context(AgentState.RUNNING)` 管理状态进入与退出。
+- 步进循环：`while current_step < max_steps and state != AgentState.FINISHED`，每次 `current_step += 1` 并调用 `await self.step()`。
+
+**Step 执行**
+- 方法：`ReActAgent.step()`。
+- 行为：`should_act = await self.think()`；若 `should_act` 为 False，则返回 `"Thinking complete - no action needed"`；否则执行并返回 `await self.act()` 的结果字符串。
+
+**Think 阶段：工具选择与消息组织**
+- 方法：`ToolCallAgent.think()`。
+- 注入下一步提示：若 `next_step_prompt` 非空，加入为一条用户消息 `Message.user_message(self.next_step_prompt)`（这使模型每步都能看到“下一步提示”）。
+- 调用模型：`response = await self.llm.ask_tool(...)`，传入：
+  - `messages=self.messages`（包含用户初始请求、各步提示、历史内容）。
+  - `system_msgs=[Message.system_message(self.system_prompt)]`（若设置）。
+  - `tools=self.available_tools.to_params()`（`ToolCollection` 转为 OpenAI 函数调用格式的工具列表）。
+  - `tool_choice=self.tool_choices`（通常是 `ToolChoice.AUTO`）。
+- 响应解析：
+  - `response.tool_calls` → 赋值 `self.tool_calls`；每个 `ToolCall` 包含 `function.name` 与 JSON 字符串 `function.arguments`。
+  - `response.content` → 作为辅助说明或自由回答。
+- 写入模型输出消息：
+  - 若存在 `tool_calls`，使用 `Message.from_tool_calls(content=..., tool_calls=...)` 记录“助手消息”且带工具调用元数据。
+  - 否则写入 `Message.assistant_message(content)`。
+- 返回值控制后续是否 `act()`：
+  - `ToolChoice.NONE`：不允许调用工具，若有 `content` 则返回 True（表示完成一步，但不会执行工具）。
+  - `ToolChoice.REQUIRED`：必须有工具调用，否则返回 True（交给 `act()` 抛错）。
+  - `ToolChoice.AUTO`（常见）：若没有工具调用但有 `content`，返回 `bool(content)`；否则返回 `bool(self.tool_calls)`。
+
+补充：`LLM.ask_tool` 会统一格式化 `messages`（含系统消息）、合并工具描述计入 token、检查 token 限额、使用非流式 `chat.completions.create` 返回 `ChatCompletionMessage`。超过 token 限额时会抛出 `TokenLimitExceeded`，`ToolCallAgent.think` 捕获后将错误告知用户并置 `state=FINISHED`。
+
+**Act 阶段：工具执行与观察写入**
+- 方法：`ToolCallAgent.act()`。
+- 无工具调用的处理：
+  - `ToolChoice.REQUIRED`：抛错 `"Tool calls required but none provided"`。
+  - 其他：返回最后一条消息 `self.messages[-1].content` 或固定字符串提示无内容。
+- 有工具调用时：
+  - 遍历每个 `command in self.tool_calls`：
+    - 重置 `_current_base64_image`。
+    - `result = await self.execute_tool(command)`。
+    - 若配置了 `max_observe`，截断结果字符串。
+    - 写日志并将工具响应写入记忆：`Message.tool_message(content=result, tool_call_id=command.id, name=command.function.name, base64_image=...)`。
+  - 返回多工具结果拼接文本。
+
+**execute_tool：工具映射与错误处理**
+- 方法：`ToolCallAgent.execute_tool(command)`。
+- 校验工具合法性：检查 `command.function.name` 是否在 `available_tools.tool_map`。
+- 参数解析：`args = json.loads(command.function.arguments or "{}")`。
+- 执行工具：`await self.available_tools.execute(name=name, tool_input=args)`。
+- 特别处理：
+  - “特殊工具”（在 `special_tool_names` 列表中，如 `Terminate`）：调用 `_handle_special_tool`，其 `_should_finish_execution` 返回 True 时将 `state=AgentState.FINISHED`。
+  - 结果若是 `ToolResult` 并带有 `base64_image`，保存到 `_current_base64_image`；随后构造标准观察字符串：
+    - 有输出：`"Observed output of cmd `<name>` executed:\n<result>"`。
+    - 无输出：`"Cmd `<name>` completed with no output"`。
+- 异常路径：JSON解析错误与执行异常都转为带错误前缀的字符串返回，并记录日志。
+
+**消息与状态演进示例**
+以下以一个常见场景为例，展示每步的消息队列与状态变化（工具为 `BrowserUseTool` 和 `Terminate`）：
+
+- 初始调用
+  - 用户调用：`await agent.run("在官网搜索产品文档并总结要点")`
+  - 状态：`IDLE → RUNNING`
+  - 记忆写入：`Message.user_message("在官网搜索产品文档并总结要点")`
+
+- 第 1 步 `think()`
+  - 注入提示：`Message.user_message(next_step_prompt)`（浏览器场景下可能由 `BrowserContextHelper.format_next_step_prompt()` 动态填充当前 URL、tabs 等占位）。
+  - 调用模型：`LLM.ask_tool`，传入系统提示与工具函数列表。
+  - 模型响应（示例）：
+    - `content`: `"我将打开官网并搜索“产品文档”"`
+    - `tool_calls`: `[{"function":{"name":"browser_use","arguments":"{\"action\":\"go_to_url\",\"url\":\"https://example.com\"}"}}]`
+  - 写入助手消息：`Message.from_tool_calls(content, tool_calls)`。
+  - 返回 True（有工具调用）。
+
+- 第 1 步 `act()`
+  - 遍历工具调用：
+    - 执行 `browser_use(action=go_to_url, url=...)` → `ToolResult(output="已打开首页")`
+    - 观察写入：`Message.tool_message(content="Observed output of cmd `browser_use` executed:\n已打开首页", name="browser_use", tool_call_id=...)`
+  - 返回结果文本。
+
+- 第 2 步 `think()`
+  - 再次注入提示（含当前浏览器状态，如 URL、tabs、视口上下内容）。
+  - 模型响应（示例）：
+    - `content`: `"在搜索框输入“产品文档”并提交"`
+    - `tool_calls`: `[{"function":{"name":"browser_use","arguments":"{\"action\":\"input_text\",\"index\":3,\"text\":\"产品文档\"}"}}]`
+  - 写入助手消息。
+  - 返回 True。
+
+- 第 2 步 `act()`
+  - 执行 `browser_use(action=input_text, index=3, text=产品文档)` → `ToolResult(output="已输入")`
+  - 写入观察消息。
+  - 返回结果文本。
+
+- 第 3 步 `think()`
+  - 注入提示（含截屏 base64 等，若有）。
+  - 模型响应（示例）：
+    - `content`: `"提取搜索结果列表并总结"`
+    - `tool_calls`: `[{"function":{"name":"browser_use","arguments":"{\"action\":\"extract_content\",\"goal\":\"获取搜索结果项及链接\"}"}}]`
+  - 写入助手消息。
+  - 返回 True。
+
+- 第 3 步 `act()`
+  - 执行提取 → `ToolResult(output="Extracted from page:\n{...结构化结果...}\n")`
+  - 写入观察消息。
+  - 返回结果文本。
+
+- 第 4 步 `think()`
+  - 模型响应（示例）：`content: "已完成，总结如下：..."；tool_calls: [{"function":{"name":"terminate","arguments":"{}"}}]`
+  - 写入助手消息，返回 True。
+
+- 第 4 步 `act()`
+  - 执行 `terminate` → `_handle_special_tool` 命中，将 `state=FINISHED`
+  - 写入观察消息。
+  - 返回最终结果文本。
+
+- 循环退出与清理
+  - 条件：`state == FINISHED` 或达到 `max_steps`。
+  - 退出 `RUNNING` 上下文 → 状态还原或被设为 `IDLE`。
+  - `ToolCallAgent.run` 的 `finally`：调用 `await self.cleanup()`，逐个工具执行 `cleanup()`（如关闭浏览器或会话）。
+
+**工具选择策略与卡死检测**
+- 工具选择模式：
+  - `NONE`：不允许工具，适合只要自然语言回答的场景。
+  - `AUTO`：模型自由选择是否调用工具；无工具时可返回纯文本。
+  - `REQUIRED`：强制工具调用，否则在 `act()` 抛错。
+- 重复检测与解套：
+  - `BaseAgent.is_stuck()` 检测助手消息重复次数达到阈值（默认 2）。
+  - 触发后 `handle_stuck_state()` 会在 `next_step_prompt` 前加入“改变策略”的提示语，指导下一步避免原路重复。
+
+**浏览器上下文注入**
+- 对使用浏览器工具的代理（如 `BrowserAgent`、`Manus` 在近期消息中检测到 `BrowserUseTool`）：
+  - `BrowserContextHelper.get_browser_state()` 获取当前 `url/title/tabs/pixels_above/below` 等。
+  - `format_next_step_prompt()` 将这些信息格式化进 `NEXT_STEP_PROMPT` 占位符。
+  - 同步一帧截屏到记忆：`Message.user_message(content="Current browser screenshot:", base64_image=...)`。
+
+**关键代码位置**
+- 入口与循环：`app/agent/base.py::run`、`app/agent/react.py::step`
+- 工具选择：`app/agent/toolcall.py::think` → `self.llm.ask_tool(...)`
+- 工具执行：`app/agent/toolcall.py::act`、`execute_tool`、`ToolCollection.execute`
+- 特殊工具终止：`app/agent/toolcall.py::_handle_special_tool` → `AgentState.FINISHED`
+- LLM函数调用：`app/llm.py::ask_tool`（消息格式、工具描述、token检查）
+- 浏览器提示注入：`app/agent/browser.py::BrowserContextHelper.format_next_step_prompt`
+
+
+        
